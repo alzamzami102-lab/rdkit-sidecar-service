@@ -1,31 +1,188 @@
 """
-RDKit Sidecar Service - FastAPI Application
+RDKit Sidecar Service - Single-file edition
 Al-Zamzami Molecular Twin v7.2
 
-Production-grade REST API for molecular geometry generation.
-Compliant with: OpenAPI 3.0, JSON:API, FAIR principles.
+This file merges:
+- validation.py
+- geometry.py
+- app.py
+for easier manual upload to GitHub/Railway.
 """
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import ValidationError
-import logging
+from pydantic import BaseModel, Field, ValidationError, field_validator
+from typing import Optional, Literal, Dict
 from datetime import datetime
+import logging
 import sys
+import re
 
-from validation import SMILESInput, GeometryRequest, HealthResponse
-from geometry import GeometryEngine
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors
 
-# Configure structured logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+
+class SMILESInput(BaseModel):
+    smiles: str = Field(..., min_length=1, max_length=2048)
+
+    @field_validator("smiles")
+    @classmethod
+    def validate_smiles_charset(cls, v: str) -> str:
+        allowed_pattern = r'^[A-Za-z0-9@+-[]()=#$:/\\.*%]+$'
+        if not re.match(allowed_pattern, v):
+            raise ValueError("SMILES contains invalid characters")
+        return v.strip()
+
+
+class GeometryRequest(BaseModel):
+    smiles: str = Field(..., min_length=1, max_length=2048)
+    method: Literal["etkdg", "mmff94", "uff"] = "etkdg"
+    num_conformers: int = Field(default=1, ge=1, le=100)
+    optimize: bool = True
+    random_seed: Optional[int] = Field(default=42, ge=0, le=2147483647)
+
+    @field_validator("smiles")
+    @classmethod
+    def validate_smiles_charset(cls, v: str) -> str:
+        allowed_pattern = r'^[A-Za-z0-9@+-[]()=#$:/\\.*%]+$'
+        if not re.match(allowed_pattern, v):
+            raise ValueError("SMILES contains invalid characters")
+        return v.strip()
+
+
+class HealthResponse(BaseModel):
+    status: Literal["healthy", "degraded", "unhealthy"]
+    rdkit_version: str
+    service_version: str = "7.2.0"
+    timestamp: str
+
+
+def generate_3d_conformer(
+    smiles: str,
+    method: str = "etkdg",
+    num_conformers: int = 1,
+    optimize: bool = True,
+    random_seed: int = 42
+) -> Dict:
+    mol = None
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"Invalid SMILES: {smiles}")
+
+        mol = Chem.AddHs(mol)
+
+        params = AllChem.ETKDGv3()
+        params.randomSeed = random_seed
+        params.numThreads = 1
+
+        conf_ids = AllChem.EmbedMultipleConfs(
+            mol,
+            numConfs=num_conformers,
+            params=params
+        )
+
+        if len(conf_ids) == 0:
+            raise RuntimeError(f"Failed to generate conformers for: {smiles}")
+
+        energies = []
+        if optimize:
+            if method == "mmff94":
+                for conf_id in conf_ids:
+                    props = AllChem.MMFFGetMoleculeProperties(mol)
+                    ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
+                    if ff is None:
+                        logger.warning(f"MMFF94 not applicable, falling back to UFF for {smiles}")
+                        ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
+                    ff.Minimize()
+                    energies.append(ff.CalcEnergy())
+            else:
+                for conf_id in conf_ids:
+                    ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
+                    ff.Minimize()
+                    energies.append(ff.CalcEnergy())
+
+        best_conf_id = conf_ids[0] if not energies else conf_ids[energies.index(min(energies))]
+        conf = mol.GetConformer(best_conf_id)
+
+        coords = []
+        for i in range(mol.GetNumAtoms()):
+            pos = conf.GetAtomPosition(i)
+            coords.append({
+                "atom": mol.GetAtomWithIdx(i).GetSymbol(),
+                "x": round(pos.x, 6),
+                "y": round(pos.y, 6),
+                "z": round(pos.z, 6)
+            })
+
+        return {
+            "success": True,
+            "smiles_canonical": Chem.MolToSmiles(Chem.RemoveHs(mol)),
+            "coordinates": coords,
+            "energy_kcal_mol": min(energies) if energies else None,
+            "num_conformers_generated": len(conf_ids),
+            "method": method,
+            "molecular_weight": round(Descriptors.MolWt(mol), 3),
+            "num_atoms": mol.GetNumAtoms(),
+            "num_heavy_atoms": mol.GetNumHeavyAtoms(),
+            "metadata": {
+                "random_seed": random_seed,
+                "optimized": optimize,
+                "version": "7.2.0"
+            }
+        }
+
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.error(f"Geometry generation error for {smiles}: {e}")
+        raise RuntimeError(f"Failed to generate 3D geometry: {str(e)}")
+    finally:
+        if mol is not None:
+            del mol
+
+
+def generate_2d_coords(smiles: str) -> Dict:
+    mol = None
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"Invalid SMILES: {smiles}")
+
+        AllChem.Compute2DCoords(mol)
+        conf = mol.GetConformer()
+
+        coords = []
+        for i in range(mol.GetNumAtoms()):
+            pos = conf.GetAtomPosition(i)
+            coords.append({
+                "atom": mol.GetAtomWithIdx(i).GetSymbol(),
+                "x": round(pos.x, 6),
+                "y": round(pos.y, 6)
+            })
+
+        return {
+            "success": True,
+            "smiles_canonical": Chem.MolToSmiles(mol),
+            "coordinates_2d": coords
+        }
+
+    except Exception as e:
+        logger.error(f"2D generation error for {smiles}: {e}")
+        raise RuntimeError(f"Failed to generate 2D coordinates: {str(e)}")
+    finally:
+        if mol is not None:
+            del mol
+
+
 app = FastAPI(
     title="RDKit Sidecar Service",
     description="Molecular geometry generation service for Al-Zamzami Molecular Twin v7.2",
@@ -35,10 +192,9 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
-# CORS middleware (configure allowed origins in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,7 +203,6 @@ app.add_middleware(
 
 @app.exception_handler(ValidationError)
 async def validation_exception_handler(request: Request, exc: ValidationError):
-    """Handle Pydantic validation errors with detailed messages."""
     return JSONResponse(
         status_code=422,
         content={
@@ -58,9 +213,8 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
     )
 
 
-@app.get("/", tags=["Root"])
+@app.get("/")
 async def root():
-    """Root endpoint - service information."""
     return {
         "service": "RDKit Sidecar Service",
         "version": "7.2.0",
@@ -68,32 +222,23 @@ async def root():
         "endpoints": {
             "health": "/health",
             "full_geometry": "/full",
-            "2d_coordinates": "/2d", 
+            "2d_coordinates": "/2d",
             "3d_coordinates": "/3d",
             "documentation": "/docs"
         }
     }
 
 
-@app.get("/health", response_model=HealthResponse, tags=["Health"])
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """
-    Health check endpoint.
-    
-    Returns RDKit version and service status.
-    Compliant with: Kubernetes liveness/readiness probe standards.
-    """
     try:
         from rdkit import rdBase
-        rdkit_version = rdBase.rdkitVersion
-        
         return HealthResponse(
             status="healthy",
-            rdkit_version=rdkit_version,
+            rdkit_version=rdBase.rdkitVersion,
             timestamp=datetime.utcnow().isoformat()
         )
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
+    except Exception:
         return HealthResponse(
             status="unhealthy",
             rdkit_version="unknown",
@@ -101,105 +246,45 @@ async def health_check():
         )
 
 
-@app.post("/full", tags=["Geometry"])
-async def generate_full_geometry(request: GeometryRequest):
-    """
-    Generate 3D molecular geometry with full optimization.
-    
-    Implements:
-    - ETKDG conformer generation (Riniker & Landrum 2015)
-    - MMFF94 or UFF force field minimization
-    - Deterministic output (fixed random seed)
-    
-    Returns:
-    - 3D coordinates (Cartesian)
-    - Minimized energy (kcal/mol)
-    - Canonical SMILES
-    - Molecular properties (MW, atom counts)
-    
-    Compliance:
-    - FAIR principles (Findable, Accessible, Interoperable, Reusable)
-    - Reproducibility (random seed control)
-    - Traceability (version metadata)
-    """
+@app.post("/full")
+async def full_geometry(request: GeometryRequest):
     try:
-        logger.info(f"Full geometry request: {request.smiles[:50]}... method={request.method}")
-        
-        result = GeometryEngine.generate_3d_conformer(
+        return generate_3d_conformer(
             smiles=request.smiles,
             method=request.method,
             num_conformers=request.num_conformers,
             optimize=request.optimize,
-            random_seed=request.random_seed
+            random_seed=request.random_seed or 42
         )
-        
-        logger.info(f"Generated {result['num_conformers_generated']} conformers, "
-                   f"E={result.get('energy_kcal_mol', 'N/A')} kcal/mol")
-        
-        return result
-        
     except ValueError as e:
-        logger.warning(f"Invalid input: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
-        logger.error(f"Geometry generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@app.post("/2d", tags=["Geometry"])
-async def generate_2d_coordinates(request: SMILESInput):
-    """
-    Generate 2D coordinates for molecular visualization.
-    
-    Returns:
-    - 2D coordinates (x, y)
-    - Canonical SMILES
-    
-    Use case: Web-based molecule rendering, structure diagrams.
-    """
-    try:
-        logger.info(f"2D coordinates request: {request.smiles[:50]}...")
-        
-        result = GeometryEngine.generate_2d_coords(request.smiles)
-        
-        return result
-        
-    except ValueError as e:
-        logger.warning(f"Invalid SMILES: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        logger.error(f"2D generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/3d", tags=["Geometry"])
-async def generate_3d_coordinates(request: GeometryRequest):
-    """
-    Generate 3D coordinates (alias for /full with default parameters).
-    
-    Convenience endpoint for standard 3D conformer generation.
-    """
+@app.post("/2d")
+async def coords_2d(request: SMILESInput):
     try:
-        logger.info(f"3D coordinates request: {request.smiles[:50]}...")
-        
-        result = GeometryEngine.generate_3d_conformer(
+        return generate_2d_coords(request.smiles)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/3d")
+async def coords_3d(request: GeometryRequest):
+    try:
+        return generate_3d_conformer(
             smiles=request.smiles,
             method=request.method,
             num_conformers=request.num_conformers,
             optimize=request.optimize,
-            random_seed=request.random_seed
+            random_seed=request.random_seed or 42
         )
-        
-        return result
-        
     except ValueError as e:
-        logger.warning(f"Invalid input: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
-        logger.error(f"3D generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
