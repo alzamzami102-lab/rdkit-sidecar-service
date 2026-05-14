@@ -1,0 +1,24 @@
+# RDKit Sidecar Service Dependencies
+# Al-Zamzami Molecular Twin v7.2
+# License compliance: All dependencies are Apache-2.0, MIT, or BSD compatible
+
+# Core RDKit (BSD-3-Clause)
+rdkit>=2023.9.1
+
+# Web framework (MIT)
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+
+# Scientific computing (BSD-3-Clause)
+numpy>=1.24.0,<2.0.0
+scipy>=1.11.0
+
+# HTTP client for health checks (Apache-2.0)
+requests==2.31.0
+
+# Logging and monitoring (MIT)
+python-json-logger==2.0.7
+
+# Validation (MIT)
+pydantic-settings==2.1.0
