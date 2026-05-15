@@ -17,7 +17,6 @@ from typing import Optional, Literal, Dict
 from datetime import datetime
 import logging
 import sys
-import re
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
@@ -30,16 +29,31 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def normalize_smiles_input(v: str) -> str:
+    if not isinstance(v, str):
+        raise ValueError("SMILES must be a string")
+    v = v.strip()
+    if not v:
+        raise ValueError("SMILES is required")
+    if len(v) > 2048:
+        raise ValueError("SMILES exceeds maximum length of 2048 characters")
+    return v
+
+
+def parse_smiles_or_raise(smiles: str):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+    return mol
+
+
 class SMILESInput(BaseModel):
     smiles: str = Field(..., min_length=1, max_length=2048)
 
     @field_validator("smiles")
     @classmethod
-    def validate_smiles_charset(cls, v: str) -> str:
-        allowed_pattern = r'^[A-Za-z0-9@+-[]()=#$:/\\.*%]+$'
-        if not re.match(allowed_pattern, v):
-            raise ValueError("SMILES contains invalid characters")
-        return v.strip()
+    def validate_smiles(cls, v: str) -> str:
+        return normalize_smiles_input(v)
 
 
 class GeometryRequest(BaseModel):
@@ -51,11 +65,8 @@ class GeometryRequest(BaseModel):
 
     @field_validator("smiles")
     @classmethod
-    def validate_smiles_charset(cls, v: str) -> str:
-        allowed_pattern = r'^[A-Za-z0-9@+-[]()=#$:/\\.*%]+$'
-        if not re.match(allowed_pattern, v):
-            raise ValueError("SMILES contains invalid characters")
-        return v.strip()
+    def validate_smiles(cls, v: str) -> str:
+        return normalize_smiles_input(v)
 
 
 class HealthResponse(BaseModel):
@@ -74,10 +85,7 @@ def generate_3d_conformer(
 ) -> Dict:
     mol = None
     try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            raise ValueError(f"Invalid SMILES: {smiles}")
-
+        mol = parse_smiles_or_raise(smiles)
         mol = Chem.AddHs(mol)
 
         params = AllChem.ETKDGv3()
@@ -102,11 +110,15 @@ def generate_3d_conformer(
                     if ff is None:
                         logger.warning(f"MMFF94 not applicable, falling back to UFF for {smiles}")
                         ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
+                    if ff is None:
+                        raise RuntimeError("Failed to initialize force field")
                     ff.Minimize()
                     energies.append(ff.CalcEnergy())
             else:
                 for conf_id in conf_ids:
                     ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
+                    if ff is None:
+                        raise RuntimeError("Failed to initialize UFF force field")
                     ff.Minimize()
                     energies.append(ff.CalcEnergy())
 
@@ -153,9 +165,7 @@ def generate_3d_conformer(
 def generate_2d_coords(smiles: str) -> Dict:
     mol = None
     try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            raise ValueError(f"Invalid SMILES: {smiles}")
+        mol = parse_smiles_or_raise(smiles)
 
         AllChem.Compute2DCoords(mol)
         conf = mol.GetConformer()
@@ -175,6 +185,8 @@ def generate_2d_coords(smiles: str) -> Dict:
             "coordinates_2d": coords
         }
 
+    except ValueError:
+        raise
     except Exception as e:
         logger.error(f"2D generation error for {smiles}: {e}")
         raise RuntimeError(f"Failed to generate 2D coordinates: {str(e)}")
